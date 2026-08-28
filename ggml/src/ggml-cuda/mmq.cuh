@@ -486,18 +486,22 @@ static __device__ __forceinline__ void ggml_cuda_mmq_write_back_mma(
     constexpr int I             = ggml_cuda_mmq_get_I(type, J, fallback);
     constexpr int rows_per_warp = ggml_cuda_mmq_get_rows_per_warp(type, J, fallback);
     constexpr int ntx           = rows_per_warp/tile_C::I; // Number of x minitiles per warp.
+    constexpr bool split_j      = type == GGML_TYPE_Q8_0 && J == 128 && !fallback && I == 64 && nwarps == 8;
+    constexpr int j_group       = split_j ? J/2 : J;
 
-    const int i0 = (threadIdx.y / ntx) * (ntx*tile_C::I);
+    const int warp_i = split_j ? threadIdx.y % 4 : threadIdx.y;
+    const int warp_j = split_j ? threadIdx.y / 4 : 0;
+    const int i0 = (warp_i / ntx) * (ntx*tile_C::I);
 
     const bool y_scale_used = y_scale != nullptr;
 
 #pragma unroll
-    for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
+    for (int j0 = 0; j0 < j_group; j0 += ntx*tile_C::J) {
 #pragma unroll
         for (int n = 0; n < ntx; ++n) {
 #pragma unroll
             for (int l = 0; l < tile_C::ne; ++l) {
-                const int j = j0 + (threadIdx.y % ntx) * tile_C::J + tile_C::get_j(l);
+                const int j = warp_j*j_group + j0 + (warp_i % ntx)*tile_C::J + tile_C::get_j(l);
 
                 if (j > j_max) {
                     continue;
@@ -1472,6 +1476,29 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
          ntx_fd);
 }
 
+static constexpr bool mmq_use_rdna3_5_q8_id_j48(
+        ggml_type type, int cc, bool fallback, bool has_ids,
+        int64_t ncols_x, int64_t nrows_x, int64_t ncols_dst, int64_t nchannels_x, int64_t nchannels_y) {
+    if (type != GGML_TYPE_Q8_0 || !GGML_CUDA_CC_IS_RDNA3_5(cc) || fallback || !has_ids ||
+            nchannels_x != 256 || nchannels_y <= 0) {
+        return false;
+    }
+
+    const int64_t columns_per_expert = (ncols_dst + nchannels_y - 1) / nchannels_y;
+    return columns_per_expert == 32 ||
+        (columns_per_expert == 64 && ((ncols_x == 2048 && nrows_x == 512) || (ncols_x == 512 && nrows_x == 2048)));
+}
+
+static_assert(mmq_use_rdna3_5_q8_id_j48(GGML_TYPE_Q8_0, GGML_CUDA_CC_RDNA3_5, false, true, 2048, 512, 8192, 256, 256));
+static_assert(mmq_use_rdna3_5_q8_id_j48(GGML_TYPE_Q8_0, GGML_CUDA_CC_RDNA3_5, false, true, 2048, 512, 16384, 256, 256));
+static_assert(mmq_use_rdna3_5_q8_id_j48(GGML_TYPE_Q8_0, GGML_CUDA_CC_RDNA3_5, false, true, 512, 2048, 16384, 256, 256));
+static_assert(!mmq_use_rdna3_5_q8_id_j48(GGML_TYPE_Q8_0, GGML_CUDA_CC_RDNA3, false, true, 2048, 512, 8192, 256, 256));
+static_assert(!mmq_use_rdna3_5_q8_id_j48(GGML_TYPE_Q8_0, GGML_CUDA_CC_RDNA3_5, true, true, 2048, 512, 8192, 256, 256));
+static_assert(!mmq_use_rdna3_5_q8_id_j48(GGML_TYPE_Q8_0, GGML_CUDA_CC_RDNA3_5, false, false, 2048, 512, 8192, 256, 256));
+static_assert(!mmq_use_rdna3_5_q8_id_j48(GGML_TYPE_Q8_0, GGML_CUDA_CC_RDNA3_5, false, true, 2048, 512, 7936, 256, 256));
+static_assert(!mmq_use_rdna3_5_q8_id_j48(GGML_TYPE_Q8_0, GGML_CUDA_CC_RDNA3_5, false, true, 2048, 512, 16640, 256, 256));
+static_assert(!mmq_use_rdna3_5_q8_id_j48(GGML_TYPE_Q8_0, GGML_CUDA_CC_RDNA3_5, false, true, 1024, 1024, 16384, 256, 256));
+
 template <ggml_type type, bool fallback>
 void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int    id    = ggml_cuda_get_device();
@@ -1480,6 +1507,16 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
 
     int J_best        = 0;
     int ntiles_J_best = INT_MAX;
+
+    if (mmq_use_rdna3_5_q8_id_j48(type, cc, fallback, args.ids_dst != nullptr,
+            args.ncols_x, args.nrows_x, args.ncols_dst, args.nchannels_x, args.nchannels_y)) {
+        constexpr int J_rdna3_5 = 48;
+        const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J_rdna3_5, fallback, cc);
+        if (config.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config, cc) <= smpbo) {
+            J_best = J_rdna3_5;
+            ntiles_J_best = 1;
+        }
+    }
 
     for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
         const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
