@@ -3465,6 +3465,39 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    if ((node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_MUL_MAT) && i + 1 < cgraph->n_nodes) {
+        ggml_tensor * next = cgraph->nodes[i + 1];
+        const ggml_tensor * src0 = node->src[0];
+        const ggml_tensor * src0_next = next->src[0];
+        const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+
+        const bool has_ids = node->op == GGML_OP_MUL_MAT_ID;
+        const bool valid_sources = next->op == node->op && src0 && src0_next && node->src[1] && next->src[1] &&
+            (!has_ids || node->src[2] && next->src[2]);
+        const bool ordinary_q8 = valid_sources && !has_ids && src0->type == GGML_TYPE_Q8_0 && src0_next->type == GGML_TYPE_Q8_0;
+        const bool shared_inputs = valid_sources && (has_ids || ordinary_q8) && node->src[1] == next->src[1] &&
+            (!has_ids || node->src[2] == next->src[2]);
+        const int64_t mmq_cols = shared_inputs ? (has_ids ? node->src[1]->ne[2] : node->src[1]->ne[1]) : 0;
+        const int64_t n_experts = shared_inputs && has_ids ? src0->ne[2] : 0;
+        const bool use_mmq = shared_inputs &&
+            ggml_cuda_should_use_mmq(src0->type, cc, mmq_cols, n_experts) &&
+            ggml_cuda_should_use_mmq(src0_next->type, cc, mmq_cols, n_experts);
+        const bool compatible = use_mmq && node->src[1]->type == GGML_TYPE_F32 &&
+            node->type == GGML_TYPE_F32 && next->type == GGML_TYPE_F32 &&
+            ggml_are_same_shape(src0, src0_next) && ggml_are_same_shape(node, next) &&
+            mmq_get_q8_1_ds_layout(src0->type) == mmq_get_q8_1_ds_layout(src0_next->type) &&
+            !blackwell_mma_available(cc);
+        const int64_t ncols_dst = has_ids ? node->ne[2] : node->ne[1];
+        const bool use_mmvq = compatible && ncols_dst <= MMVQ_MAX_BATCH_SIZE &&
+            (!has_ids || ncols_dst <= get_mmvq_mmid_max_batch(src0->type, cc) ||
+             ncols_dst <= get_mmvq_mmid_max_batch(src0_next->type, cc));
+
+        if (compatible && !use_mmvq) {
+            ggml_cuda_mul_mat_q_pair(*cuda_ctx, node, next);
+            return 1;
+        }
+    }
+
     bool fused_mul_mat_vec = false;
     int  fused_node_count  = 0;
 

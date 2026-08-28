@@ -463,14 +463,7 @@ static __global__ void quantize_mmq_q8_1(
     constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
     constexpr int vals_per_sum   = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
 
-    const int64_t i0 = ((int64_t)blockDim.x*blockIdx.y + threadIdx.x)*4;
-
-    if (i0 >= ne0) {
-        return;
-    }
-
-    const int64_t i00 = i0;
-    ggml_cuda_pdl_sync();
+    const int64_t first_chunk = (int64_t) blockIdx.y * CUDA_QUANTIZE_MMQ_CHUNKS_PER_BLOCK;
 
     int64_t base_idx;
     if constexpr (scatter) {
@@ -485,70 +478,73 @@ static __global__ void quantize_mmq_q8_1(
     const float4 * x4 = (const float4 *) x;
     block_q8_1_mmq * y = (block_q8_1_mmq *) vy;
 
-    const int64_t k_block = i0 / QK8_1_MMQ; // column block in the channel
-    const int64_t iqs     = i0 % QK8_1_MMQ; // quant index in block
+    ggml_cuda_pdl_sync();
 
-    // Load 4 floats per thread and calculate max. abs. value between them:
-    const float4 xi = i0 < ne00 ? x4[(base_idx + i00)/4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    float amax = fabsf(xi.x);
-    amax = fmaxf(amax, fabsf(xi.y));
-    amax = fmaxf(amax, fabsf(xi.z));
-    amax = fmaxf(amax, fabsf(xi.w));
-
-    // Exchange max. abs. value between vals_per_scale/4 threads.
 #pragma unroll
-    for (int offset = vals_per_scale/8; offset > 0; offset >>= 1) {
-        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
-    }
-
-    float sum;
-    if (ds_layout != MMQ_Q8_1_DS_LAYOUT_D4) {
-        sum = xi.x + xi.y + xi.z + xi.w;
-
-        // Calculate sums across vals_per_sum/4 threads.
-#pragma unroll
-        for (int offset = vals_per_sum/8; offset > 0; offset >>= 1) {
-            sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset, WARP_SIZE);
-        }
-    }
-
-    const float d_inv = 127.0f / amax;
-    char4 q;
-    q.x = roundf(xi.x*d_inv);
-    q.y = roundf(xi.y*d_inv);
-    q.z = roundf(xi.z*d_inv);
-    q.w = roundf(xi.w*d_inv);
-    const float d = 1.0f / d_inv;
-
-    // write the block once (normal) or to each of the token's compact rows (scatter)
-    const int nwrite = scatter ? n_expert_used : 1;
-#pragma unroll
-    for (int slot = 0; slot < nwrite; ++slot) {
-        int64_t ib;
-        if constexpr (scatter) {
-            const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
-            ib = k_block*ne1 + i;
-        } else {
-            const int64_t ib0 = blockIdx.z*((int64_t)gridDim.x*gridDim.y*blockDim.x/QK8_1); // first block of channel
-            ib = ib0 + k_block*ne1 + blockIdx.x;
+    for (int chunk = 0; chunk < CUDA_QUANTIZE_MMQ_CHUNKS_PER_BLOCK; ++chunk) {
+        const int64_t i0 = ((first_chunk + chunk) * blockDim.x + threadIdx.x) * 4;
+        if (i0 >= ne0) {
+            break;
         }
 
-        // Write back 4 int8 values as a single 32 bit value for better memory bandwidth:
-        char4 * yqs4 = (char4 *) y[ib].qs;
-        yqs4[iqs/4] = q;
+        const int64_t k_block = i0 / QK8_1_MMQ;
+        const int64_t iqs     = i0 % QK8_1_MMQ;
+        const float4 xi = i0 < ne00 ? x4[(base_idx + i0)/4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        float amax = fabsf(xi.x);
+        amax = fmaxf(amax, fabsf(xi.y));
+        amax = fmaxf(amax, fabsf(xi.z));
+        amax = fmaxf(amax, fabsf(xi.w));
 
-        if (ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6) {
-            if (iqs % 16 == 0 && iqs < 96) {
-                y[ib].d2s6[2 + iqs/16] = sum;
-                if (iqs % 64 == 0) {
-                    y[ib].d2s6[iqs/64] = d;
-                }
+#pragma unroll
+        for (int offset = vals_per_scale/8; offset > 0; offset >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
+        }
+
+        float sum;
+        if (ds_layout != MMQ_Q8_1_DS_LAYOUT_D4) {
+            sum = xi.x + xi.y + xi.z + xi.w;
+#pragma unroll
+            for (int offset = vals_per_sum/8; offset > 0; offset >>= 1) {
+                sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset, WARP_SIZE);
             }
-        } else if (iqs % 32 == 0) {
-            if (ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4) {
-                y[ib].ds4[iqs/32] = make_half2(d, sum);
+        }
+
+        const float d_inv = 127.0f / amax;
+        char4 q;
+        q.x = roundf(xi.x*d_inv);
+        q.y = roundf(xi.y*d_inv);
+        q.z = roundf(xi.z*d_inv);
+        q.w = roundf(xi.w*d_inv);
+        const float d = 1.0f / d_inv;
+
+        const int nwrite = scatter ? n_expert_used : 1;
+#pragma unroll
+        for (int slot = 0; slot < nwrite; ++slot) {
+            int64_t ib;
+            if constexpr (scatter) {
+                const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
+                ib = k_block*ne1 + i;
             } else {
-                y[ib].d4[iqs/32]  = d;
+                const int64_t ib0 = blockIdx.z * ((int64_t) gridDim.x * ne0 / QK8_1_MMQ);
+                ib = ib0 + k_block*ne1 + blockIdx.x;
+            }
+
+            char4 * yqs4 = (char4 *) y[ib].qs;
+            yqs4[iqs/4] = q;
+
+            if (ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6) {
+                if (iqs % 16 == 0 && iqs < 96) {
+                    y[ib].d2s6[2 + iqs/16] = sum;
+                    if (iqs % 64 == 0) {
+                        y[ib].d2s6[iqs/64] = d;
+                    }
+                }
+            } else if (iqs % 32 == 0) {
+                if (ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4) {
+                    y[ib].ds4[iqs/32] = make_half2(d, sum);
+                } else {
+                    y[ib].d4[iqs/32] = d;
+                }
             }
         }
     }
@@ -580,7 +576,8 @@ void quantize_mmq_q8_1_cuda(
     GGML_ASSERT(ne0 % QK8_1_MMQ == 0);
 
     // ne1 tends to assume the highest values, therefore use it as the "x" dimension of the CUDA grid:
-    const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
+    const int64_t vals_per_block = 4 * CUDA_QUANTIZE_BLOCK_SIZE_MMQ * CUDA_QUANTIZE_MMQ_CHUNKS_PER_BLOCK;
+    const int64_t block_num_y = (ne0 + vals_per_block - 1) / vals_per_block;
     const dim3 num_blocks(ne1, block_num_y, ne2*ne3);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
     switch (mmq_get_q8_1_ds_layout(type_src0)) {
@@ -610,7 +607,8 @@ void quantize_scatter_mmq_q8_1_cuda(
     GGML_ASSERT(ne00 % 4 == 0);
     GGML_ASSERT(ne0 % QK8_1_MMQ == 0);
 
-    const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
+    const int64_t vals_per_block = 4 * CUDA_QUANTIZE_BLOCK_SIZE_MMQ * CUDA_QUANTIZE_MMQ_CHUNKS_PER_BLOCK;
+    const int64_t block_num_y = (ne0 + vals_per_block - 1) / vals_per_block;
     const dim3 num_blocks(n_tokens, block_num_y, 1);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
     switch (mmq_get_q8_1_ds_layout(type_src0)) {

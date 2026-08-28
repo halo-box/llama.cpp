@@ -7,9 +7,11 @@
 
 #define CUDA_QUANTIZE_BLOCK_SIZE     256
 #define CUDA_QUANTIZE_BLOCK_SIZE_MMQ 128
+#define CUDA_QUANTIZE_MMQ_CHUNKS_PER_BLOCK 2
 
 static_assert(MATRIX_ROW_PADDING %    CUDA_QUANTIZE_BLOCK_SIZE      == 0, "Risk of out-of-bounds access.");
 static_assert(MATRIX_ROW_PADDING % (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ) == 0, "Risk of out-of-bounds access.");
+static_assert((4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ) % QK8_1_MMQ == 0, "Quantization chunks must contain complete Q8_1 MMQ blocks.");
 
 typedef void (*quantize_cuda_t)(
         const float * x, const int32_t * ids, void * vy,
