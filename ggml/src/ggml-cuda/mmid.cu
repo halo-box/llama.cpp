@@ -60,8 +60,8 @@ static __global__ void mm_ids_helper(
         }
     } else {
         // Implementation optimized for specific numbers of experts used:
-        static_assert(n_expert_used == 6 || warp_size % n_expert_used == 0, "bad n_expert_used");
-        const int neu_padded = n_expert_used == 6 ? 8 : n_expert_used; // Padded to next higher power of 2.
+        static_assert(n_expert_used == 6 || n_expert_used == 10 || warp_size % n_expert_used == 0, "bad n_expert_used");
+        const int neu_padded = n_expert_used == 6 ? 8 : (n_expert_used == 10 ? 16 : n_expert_used);
         for (int it0 = 0; it0 < n_tokens; it0 += warp_size/neu_padded) {
             const int it = it0 + threadIdx.x / neu_padded;
 
@@ -120,6 +120,94 @@ static __global__ void mm_ids_helper(
     expert_bounds[gridDim.x] = nex_prev + it_compact;
 }
 
+static __global__ void mm_ids_helper_top10_parallel(
+        const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst,
+        int32_t * __restrict__ expert_bounds, const int n_tokens, const int nchannels_y,
+        const int si1, const int sis1, const bool write_inverse) {
+    constexpr int warp_size = 32;
+    constexpr int nwarps = 8;
+    constexpr int n_expert_used = 10;
+    constexpr int neu_padded = 16;
+
+    const int expert = blockIdx.x;
+    const int warp = threadIdx.x / warp_size;
+    const int lane = threadIdx.x % warp_size;
+    const int tokens_per_warp = (n_tokens + nwarps - 1) / nwarps;
+    const int token_begin = min(warp * tokens_per_warp, n_tokens);
+    const int token_end = min(token_begin + tokens_per_warp, n_tokens);
+
+    extern __shared__ char data_mm_ids_helper[];
+    mm_ids_helper_store * store = (mm_ids_helper_store *) data_mm_ids_helper;
+    __shared__ int warp_counts[nwarps];
+    __shared__ int warp_nex_prev[nwarps];
+
+    int nex_prev = 0;
+    int it_compact = 0;
+    for (int it0 = token_begin; it0 < token_end; it0 += warp_size / neu_padded) {
+        const int it = it0 + lane / neu_padded;
+        const int iex = lane % neu_padded;
+        const int expert_used = iex < n_expert_used && it < token_end ? ids[it * si1 + iex] : INT_MAX;
+        const int iex_used = expert_used == expert ? iex : -1;
+        nex_prev += expert_used < expert;
+
+        const int it_compact_add_self = warp_reduce_any<neu_padded>(iex_used != -1);
+        int it_compact_add_lower = 0;
+#pragma unroll
+        for (int offset = neu_padded; offset < warp_size; offset += neu_padded) {
+            const int tmp = __shfl_up_sync(0xFFFFFFFF, it_compact_add_self, offset, warp_size);
+            if (lane >= offset) {
+                it_compact_add_lower += tmp;
+            }
+        }
+        if (iex_used != -1) {
+            store[token_begin + it_compact + it_compact_add_lower] = mm_ids_helper_store(it, iex_used);
+        }
+        it_compact += __shfl_sync(0xFFFFFFFF, it_compact_add_lower + it_compact_add_self, warp_size - 1, warp_size);
+    }
+
+    nex_prev = warp_reduce_sum<warp_size>(nex_prev);
+    if (lane == 0) {
+        warp_counts[warp] = it_compact;
+        warp_nex_prev[warp] = nex_prev;
+    }
+    __syncthreads();
+
+    int compact_prefix = 0;
+    int nex_prev_total = 0;
+#pragma unroll
+    for (int i = 0; i < nwarps; ++i) {
+        nex_prev_total += warp_nex_prev[i];
+        if (i < warp) {
+            compact_prefix += warp_counts[i];
+        }
+    }
+
+    for (int itc = lane; itc < it_compact; itc += warp_size) {
+        const mm_ids_helper_store store_it = store[token_begin + itc];
+        const int it = store_it.it();
+        const int iex_used = store_it.iex_used();
+        const int compact = nex_prev_total + compact_prefix + itc;
+        ids_dst[compact] = it * n_expert_used + iex_used;
+        if (write_inverse) {
+            ids_src1[it * n_expert_used + iex_used] = compact;
+        } else {
+            ids_src1[compact] = it * sis1 + iex_used % nchannels_y;
+        }
+    }
+
+    if (threadIdx.x == 0) {
+        expert_bounds[expert] = nex_prev_total;
+        if (expert == static_cast<int>(gridDim.x) - 1) {
+            int total_count = 0;
+#pragma unroll
+            for (int i = 0; i < nwarps; ++i) {
+                total_count += warp_counts[i];
+            }
+            expert_bounds[gridDim.x] = nex_prev_total + total_count;
+        }
+    }
+}
+
 template <int n_expert_used_template>
 static void launch_mm_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
@@ -130,6 +218,20 @@ static void launch_mm_ids_helper(
     const int id = ggml_cuda_get_device();
     const int warp_size = ggml_cuda_info().devices[id].warp_size;
     const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
+
+    if constexpr (n_expert_used_template == 10) {
+        if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[id].cc) && n_tokens >= 64) {
+            CUDA_SET_SHARED_MEMORY_LIMIT(mm_ids_helper_top10_parallel, smpbo);
+            const dim3 num_blocks(n_experts, 1, 1);
+            const dim3 block_size(warp_size * 8, 1, 1);
+            const size_t nbytes_shared = n_tokens * sizeof(mm_ids_helper_store);
+            GGML_ASSERT(nbytes_shared <= smpbo);
+            mm_ids_helper_top10_parallel<<<num_blocks, block_size, nbytes_shared, stream>>>
+                (ids, ids_src1, ids_dst, expert_bounds, n_tokens, nchannels_y, si1, sis1, write_inverse);
+            return;
+        }
+    }
+
     CUDA_SET_SHARED_MEMORY_LIMIT(mm_ids_helper<n_expert_used_template>, smpbo);
 
     const dim3 num_blocks(n_experts, 1, 1);
@@ -155,6 +257,9 @@ void ggml_cuda_launch_mm_ids_helper(
             break;
         case  8:
             launch_mm_ids_helper< 8>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+            break;
+        case 10:
+            launch_mm_ids_helper<10>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
             break;
         case 16:
             launch_mm_ids_helper<16>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);

@@ -10,6 +10,11 @@ layout(local_size_x = num_threads, local_size_y = 1, local_size_z = 1) in;
 void main() {
     uint idx = get_idx();
 
+    const bool contiguous = norepeat &&
+        p.nb00 == 1 && p.nb01 == p.ne00 && p.nb02 == p.ne00*p.ne01 && p.nb03 == p.ne00*p.ne01*p.ne02 &&
+        p.nb10 == 1 && p.nb11 == p.ne10 && p.nb12 == p.ne10*p.ne11 && p.nb13 == p.ne10*p.ne11*p.ne12 &&
+        p.nb20 == 1 && p.nb21 == p.ne20 && p.nb22 == p.ne20*p.ne21 && p.nb23 == p.ne20*p.ne21*p.ne22;
+
     // num_threads * num_iter must equal 512, to match the wg_denoms and get_idx calculation
     const uint num_iter = 2;
 
@@ -18,9 +23,13 @@ void main() {
             continue;
         }
         uint i00, i01, i02, i03;
-        get_indices(idx, i00, i01, i02, i03);
 
-        data_d[get_doffset() + dst_idx(i00, i01, i02, i03)] = D_TYPE(FLOAT_TYPE(data_a[get_aoffset() + src0_idx(i00, i01, i02, i03)]) * FLOAT_TYPE(data_b[get_boffset() + src1_idx(i00, i01, i02, i03)]));
+        if (contiguous) {
+            data_d[get_doffset() + idx] = D_TYPE(FLOAT_TYPE(data_a[get_aoffset() + idx]) * FLOAT_TYPE(data_b[get_boffset() + idx]));
+        } else {
+            get_indices(idx, i00, i01, i02, i03);
+            data_d[get_doffset() + dst_idx(i00, i01, i02, i03)] = D_TYPE(FLOAT_TYPE(data_a[get_aoffset() + src0_idx(i00, i01, i02, i03)]) * FLOAT_TYPE(data_b[get_boffset() + src1_idx(i00, i01, i02, i03)]));
+        }
 
         idx += num_threads;
     }

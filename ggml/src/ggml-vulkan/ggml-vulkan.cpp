@@ -9282,7 +9282,10 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     const bool y_f32_kernel = src1->type == GGML_TYPE_F32 && !y_non_contig;
 
-    bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
+    // RDNA 3.5 cooperative-matrix dequant is faster than integer dot for wide prompt batches.
+    const bool prefer_f16_prompt = ctx->device->vendor_id == VK_VENDOR_ID_AMD && ne11 >= 256;
+    bool quantize_y = !prefer_f16_prompt && ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 &&
+                      ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
 
     // Check for mmq first
     vk_matmul_pipeline mmp = quantize_y ? ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, GGML_TYPE_Q8_1, (ggml_prec)dst->op_params[0]) : nullptr;
@@ -10291,7 +10294,10 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 
     const bool y_f32_kernel = src1->type == GGML_TYPE_F32 && !y_non_contig;
 
-    bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
+    // RDNA 3.5 cooperative-matrix dequant is faster than integer dot for large top-10 MoE batches.
+    const bool prefer_f16_moe = ctx->device->vendor_id == VK_VENDOR_ID_AMD && nei0 == 10 && nei1 >= 256;
+    bool quantize_y = !prefer_f16_moe && ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 &&
+                      ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
 
     // Check for mmq first
     vk_matmul_pipeline mmp = quantize_y ? ggml_vk_get_mul_mat_mat_id_pipeline(ctx, src0->type, GGML_TYPE_Q8_1, (ggml_prec)dst->op_params[0]) : nullptr;
@@ -13170,6 +13176,49 @@ static void ggml_vk_concat(ggml_backend_vk_context * ctx, vk_context& subctx, co
     const uint32_t nb00 = quantized ? 1 : src0->nb[0] / unit_size;
     const uint32_t nb10 = quantized ? 1 : src1->nb[0] / unit_size;
     const uint32_t nb20 = quantized ? 1 :  dst->nb[0] / unit_size;
+
+    const bool transpose_dim0 = op_params[0] == 0 && !quantized &&
+        (unit_size == 2 || unit_size == 4) && ggml_is_contiguous(src0) && ggml_is_contiguous(dst) &&
+        src1->nb[1] == unit_size && src1->nb[0] == src1->ne[1] * unit_size &&
+        src0->ne[1] == src1->ne[1] && src0->ne[2] == src1->ne[2] && src0->ne[3] == src1->ne[3];
+
+    if (transpose_dim0) {
+        // Copy the short recurrent state with destination row strides from the concat output.
+        ggml_tensor dst0 = *dst;
+        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+            dst0.ne[i] = src0->ne[i];
+        }
+        dst0.op = GGML_OP_CPY;
+        ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, &dst0, GGML_OP_CPY,
+            vk_op_unary_push_constants_init(src0, &dst0));
+
+        // The large input is a 0<->1 transposed view. Reuse the tiled copy shader and
+        // write it after the state prefix while preserving the full concat row stride.
+        ggml_tensor dst1 = *dst;
+        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+            dst1.ne[i] = src1->ne[i];
+        }
+        dst1.data = (uint8_t *) dst->data + src0->ne[0] * unit_size;
+        dst1.view_src = nullptr;
+        dst1.view_offs = 0;
+        dst1.op = GGML_OP_CPY;
+
+        vk_pipeline pipeline = unit_size == 4 ? ctx->device->pipeline_cpy_transpose_32
+                                               : ctx->device->pipeline_cpy_transpose_16;
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+        vk_op_unary_push_constants pc = vk_op_unary_push_constants_init(src1, &dst1);
+        init_pushconst_tensor_offsets(ctx, pc, src1, nullptr, nullptr, nullptr, &dst1);
+
+        std::array<uint32_t, 3> elements = {
+            std::min((uint32_t) CEIL_DIV(dst1.ne[0], 32), ctx->device->properties.limits.maxComputeWorkGroupCount[0]),
+            std::min((uint32_t) CEIL_DIV(dst1.ne[1], 32), ctx->device->properties.limits.maxComputeWorkGroupCount[1]),
+            std::min((uint32_t) (dst1.ne[2] * dst1.ne[3]), ctx->device->properties.limits.maxComputeWorkGroupCount[2]),
+        };
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            { ggml_vk_tensor_subbuffer(ctx, src1, true), ggml_vk_tensor_subbuffer(ctx, &dst1, true) }, pc, elements);
+        return;
+    }
 
     vk_op_concat_push_constants pc {{
         ne20 * (uint32_t)dst->ne[1] * (uint32_t)dst->ne[2] * (uint32_t)dst->ne[3],

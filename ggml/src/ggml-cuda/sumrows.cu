@@ -1,7 +1,23 @@
 #include "reduce_rows.cuh"
 #include "sumrows.cuh"
 
+static __global__ void sum_rows_4_f32(const float * x, float * dst, int nrows) {
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= nrows) {
+        return;
+    }
+    const float * xr = x + int64_t(row) * 4;
+    dst[row] = (xr[0] + xr[2]) + (xr[1] + xr[3]);
+}
+
 void sum_rows_f32_cuda(const float * x, float * dst, const int ncols, const int nrows, cudaStream_t stream) {
+    if (ncols == 4 && nrows <= INT_MAX) {
+        constexpr int threads = 256;
+        const int blocks = (nrows + threads - 1) / threads;
+        const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, stream);
+        ggml_cuda_kernel_launch(sum_rows_4_f32, launch_params, x, dst, nrows);
+        return;
+    }
     const int  id  = ggml_cuda_get_device();
     const int  nsm = ggml_cuda_info().devices[id].nsm;
     const dim3 block_nums(nrows, 1, 1);
@@ -28,6 +44,14 @@ void ggml_cuda_op_sum_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     const int64_t ncols = src0->ne[0];
     const int64_t nrows = ggml_nrows(src0);
+
+    if (ncols == 4 && nrows <= INT_MAX) {
+        constexpr int threads = 256;
+        const int blocks = ((int) nrows + threads - 1) / threads;
+        const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, stream);
+        ggml_cuda_kernel_launch(sum_rows_4_f32, launch_params, src0_d, dst_d, (int) nrows);
+        return;
+    }
 
     const dim3 block_nums(nrows, 1, 1);
 
