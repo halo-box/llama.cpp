@@ -990,7 +990,19 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
-        return rows->ne[0] == (int64_t) pmodel.hparams.ple_n_heads * params.ubatch.n_tokens;
+
+        const int64_t n_want = (int64_t) pmodel.hparams.ple_n_heads * params.ubatch.n_tokens;
+
+        // exactly one of the two is built: `rows` when the table is a tensor and the
+        // graph does the get_rows, `embd` when --ngram-on-disk gathered it in set_input.
+        // Dereferencing `rows` unconditionally segfaults on every on-disk decode.
+        if (rows) {
+            return rows->ne[0] == n_want;      // I32 [n_heads*n_tokens]
+        }
+        if (embd) {
+            return embd->ne[1] == n_want;      // F32 [ple_head_dim, n_heads*n_tokens]
+        }
+        return false;
     }
 
     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
