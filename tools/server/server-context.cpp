@@ -342,6 +342,10 @@ struct server_slot {
         return res;
     }
 
+    // conversation key whose KV this slot currently holds, so a returning turn that lands on
+    // the same slot is not re-read from disk over the top of an identical copy [TAG_KV_DISK_RESIDENT]
+    std::string kv_conv_key;
+
     void prompt_clear() {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
@@ -351,6 +355,8 @@ struct server_slot {
         }
 
         prompt.clear();
+
+        kv_conv_key.clear();
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -1877,7 +1883,16 @@ private:
         // turn ended with, and only the new user message has to be prefilled. [TAG_KV_DISK_LOAD]
         if (ret && prompt_cache && prompt_cache->disk_enabled() &&
                 task.type == SERVER_TASK_TYPE_COMPLETION && !task.params.kv_conv_key.empty()) {
-            prompt_cache->disk_load(ret->prompt, task.params.kv_conv_key, ret->ctx_tgt, ret->ctx_dft, ret->id);
+            if (ret->kv_conv_key == task.params.kv_conv_key) {
+                // the slot already holds exactly this conversation. Reading it back would install a
+                // byte-identical copy at the cost of a multi-hundred-MiB read and would throw away
+                // the checkpoints built since. Let the ordinary prefix logic reuse what is resident.
+                SLT_DBG(*ret, "%s", "conversation already resident, skipping disk restore\n");
+            } else if (prompt_cache->disk_load(ret->prompt, task.params.kv_conv_key, ret->ctx_tgt, ret->ctx_dft, ret->id)) {
+                ret->kv_conv_key = task.params.kv_conv_key;
+            } else {
+                ret->kv_conv_key.clear();
+            }
         }
 
         return ret;
@@ -2331,7 +2346,12 @@ private:
 
                 server_kv_add_message(base, "assistant", reply);
 
-                prompt_cache->disk_store(slot.prompt, sha1_hex(base), slot.ctx_tgt, slot.ctx_dft, slot.id);
+                const std::string key_store = sha1_hex(base);
+
+                prompt_cache->disk_store(slot.prompt, key_store, slot.ctx_tgt, slot.ctx_dft, slot.id);
+
+                // the next turn of this conversation looks itself up by exactly this key
+                slot.kv_conv_key = key_store;
             }
         }
 
