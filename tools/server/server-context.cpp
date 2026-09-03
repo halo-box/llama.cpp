@@ -307,6 +307,14 @@ struct server_slot {
             return false;
         }
 
+        // persist before the in-memory tier so the conversation survives a restart even when the
+        // RAM tier is disabled or full
+        const bool stored = prompt_cache.disk_store(prompt, ctx_tgt, ctx_dft, id);
+
+        if (!prompt_cache.ram_enabled) {
+            return stored;
+        }
+
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
@@ -1507,6 +1515,18 @@ private:
                 if (slot.stats.n_gen > 0) {
                     metrics_on_prediction(slot);
                 }
+
+                // persist the finished conversation while its KV is still in the slot, so the next
+                // turn restores it instead of prefilling it again. This runs on the inference thread
+                // because reading sequence state has to; it costs one sequential write of the state
+                // (~70 ms for a typical conversation, ~0.8 s for a full context) once per turn.
+                // [TAG_KV_DISK_SAVE]
+                if (prompt_cache && prompt_cache->disk_enabled() &&
+                        slot.stats.n_gen > 0 && slot.task &&
+                        !slot.task->is_child() &&
+                        slot.task->type == SERVER_TASK_TYPE_COMPLETION) {
+                    prompt_cache->disk_store(slot.prompt, slot.ctx_tgt, slot.ctx_dft, slot.id);
+                }
             };
 
             slot.reset();
@@ -1547,17 +1567,38 @@ private:
             batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
         }
 
-        if (params_base.cache_ram_mib != 0) {
+        // the on-disk tier works on its own, so the cache object is also needed when the RAM tier
+        // is switched off with `--cache-ram 0`
+        if (params_base.cache_ram_mib != 0 || !params_base.kv_cache_dir.empty()) {
             if (params_base.cache_ram_mib < 0) {
                 SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
-            } else {
+            } else if (params_base.cache_ram_mib > 0) {
                 SRV_TRC("prompt cache is enabled, size limit: %d MiB\n", params_base.cache_ram_mib);
+            } else {
+                SRV_TRC("%s", "in-memory prompt cache is disabled\n");
             }
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
+        }
+
+        if (prompt_cache && !params_base.kv_cache_dir.empty()) {
+            // The fingerprint is bound to the model, so two models sharing a directory never collide.
+            // Keyed on the weights rather than on --alias: renaming an alias must not invalidate a
+            // cache, and two models sharing one must not be able to read each other's state.
+            char buf_desc[128] = {0};
+            llama_model_desc(model_tgt, buf_desc, sizeof(buf_desc));
+
+            const std::string model_tag = params_base.model.path + "|" + buf_desc;
+
+            if (!prompt_cache->disk_init(params_base.kv_cache_dir, model_tag,
+                        1024ull*1024ull*(size_t) params_base.kv_cache_max_mib,
+                        (size_t) params_base.kv_cache_min_toks,
+                        mctx != nullptr)) {
+                SRV_WRN("%s", "on-disk KV cache could not be initialised, continuing without it\n");
+            }
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
@@ -1617,8 +1658,8 @@ private:
         metrics.init();
 
         if (params_base.cache_idle_slots) {
-            if (params_base.cache_ram_mib == 0) {
-                SRV_WRN("%s", "--cache-idle-slots requires --cache-ram, disabling\n");
+            if (params_base.cache_ram_mib == 0 && params_base.kv_cache_dir.empty()) {
+                SRV_WRN("%s", "--cache-idle-slots requires --cache-ram or --kv-cache-dir, disabling\n");
                 params_base.cache_idle_slots = false;
             } else {
                 if (params_base.kv_unified) {
@@ -1826,6 +1867,14 @@ private:
 
             // cache prompts only for completion tasks
             update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
+
+            // the on-disk store holds far more conversations than there are slots, so it is always
+            // worth a look - even when this slot was picked for already sharing a prefix. disk_load
+            // only moves if it beats what the slot holds, so consulting it cannot make things worse.
+            if (!update_cache && prompt_cache && prompt_cache->disk_enabled() &&
+                    task.type == SERVER_TASK_TYPE_COMPLETION) {
+                update_cache = true;
+            }
 
             if (update_cache) {
                 SRV_TRC("%s", "updating prompt cache\n");

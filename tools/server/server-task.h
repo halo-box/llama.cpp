@@ -609,10 +609,23 @@ struct server_prompt_cache_state {
     }
 };
 
+// one conversation persisted under --kv-cache-dir. The tokens are kept resident so a lookup can
+// measure the longest common prefix without touching the (multi-GiB) state blob on disk.
+struct server_prompt_cache_disk_entry {
+    std::string   key; // sha1(model tag + packed prompt tokens), also the file name
+    server_tokens tokens;
+    size_t        n_packed = 0; // length of the serialized token blob, sizes the restore buffer
+    size_t        bytes    = 0;
+    int64_t       t_last   = 0; // LRU clock, seeded from the file mtime at startup
+};
+
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
+
+        // cache_ram_mib == 0 disables the in-memory tier, but the on-disk tier can still be used
+        this->ram_enabled  = limit_size_mib != 0;
     }
 
     std::list<server_prompt_cache_state> states;
@@ -623,6 +636,8 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
+    bool ram_enabled = true;
+
     size_t size() const;
 
     size_t n_tokens() const;
@@ -632,6 +647,40 @@ struct server_prompt_cache {
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();
+
+    //
+    // on-disk tier (--kv-cache-dir)
+    //
+
+    std::string dir;       // "" = disabled
+    std::string model_tag; // mixed into the fingerprint so two models never share an entry
+
+    size_t disk_limit_size = 0; // in bytes, 0 = no limit
+    size_t disk_min_tokens = 0;
+    bool   disk_has_mtmd   = false;
+
+    std::vector<server_prompt_cache_disk_entry> disk;
+
+    bool disk_enabled() const { return !dir.empty(); }
+
+    // scan dir and build the in-memory index; returns false if the directory is unusable
+    bool disk_init(const std::string & dir, const std::string & model_tag, size_t limit_size, size_t min_tokens, bool has_mtmd);
+
+    // persist prompt's KV state, replacing any stored entry that is a prefix of it (an earlier turn
+    // of the same conversation). Returns true if something was written.
+    bool disk_store(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+
+    // restore the stored entry sharing the longest prefix with tokens_new, if it beats what the slot
+    // already holds. Mirrors the in-memory load() selection rule.
+    bool disk_load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+
+    // evict least-recently-used entries until the store fits in disk_limit_size
+    void disk_prune();
+
+    std::string disk_path(const std::string & key) const;
+
+    // stats, for logging
+    size_t disk_size() const;
 };
 
 // used exclusively by router mode

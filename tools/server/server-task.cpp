@@ -1709,6 +1709,11 @@ size_t server_prompt_cache::n_tokens() const {
 }
 
 server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+    // `--cache-ram 0` leaves limit_size at 0, which otherwise reads as "no limit" here
+    if (!ram_enabled) {
+        return nullptr;
+    }
+
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
@@ -1862,6 +1867,14 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         prompt = std::move(it_best->prompt);
 
         states.erase(it_best);
+
+        return true;
+    }
+
+    // nothing better in memory. The on-disk tier holds far more conversations than RAM can, and on
+    // this class of machine reading a state back beats re-prefilling it by two orders of magnitude.
+    if (disk_enabled()) {
+        disk_load(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot);
     }
 
     return true;

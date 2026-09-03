@@ -657,6 +657,12 @@ struct common_params {
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
 
+    // on-disk KV cache: conversations are fingerprinted (sha1 of model tag + prompt tokens) and their
+    // KV state persisted, so a returning conversation is restored from disk instead of re-prefilled
+    std::string kv_cache_dir      = "";   // "" = disabled
+    int32_t     kv_cache_max_mib  = 0;    // LRU budget on disk, 0 = no limit
+    int32_t     kv_cache_min_toks = 256;  // do not persist prompts shorter than this
+
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT

@@ -1737,6 +1737,36 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"-kvcd", "--kv-cache-dir"}, "PATH",
+        "directory holding the on-disk KV cache. Conversations are fingerprinted and their KV state is\n"
+        "persisted there, so a returning conversation is restored instead of re-prefilled (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.kv_cache_dir = value;
+        }
+    ).set_env("LLAMA_ARG_KV_CACHE_DIR").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--kv-cache-max"}, "N",
+        string_format("maximum size of the on-disk KV cache in MiB, least-recently-used entries are evicted "
+            "(default: %d, 0 = no limit)", params.kv_cache_max_mib),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("kv-cache-max must be non-negative");
+            }
+            params.kv_cache_max_mib = value;
+        }
+    ).set_env("LLAMA_ARG_KV_CACHE_MAX").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--kv-cache-min-tokens"}, "N",
+        string_format("do not persist prompts shorter than this to the on-disk KV cache (default: %d)",
+            params.kv_cache_min_toks),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("kv-cache-min-tokens must be non-negative");
+            }
+            params.kv_cache_min_toks = value;
+        }
+    ).set_env("LLAMA_ARG_KV_CACHE_MIN_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",
