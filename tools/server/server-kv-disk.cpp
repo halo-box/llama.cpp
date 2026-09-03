@@ -27,6 +27,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <list>
 #include <vector>
 
 //
@@ -243,6 +244,96 @@ llama_tokens kv_packed_to_tokens(const std::vector<char> & packed) {
     return out;
 }
 
+// Context checkpoints have to travel with the state.
+//
+// On a sliding-window model the sequence state only carries the SWA window, so after a restore
+// llama_memory_seq_pos_min sits above pos_min_thold and the server will only reuse the prompt if a
+// checkpoint reaches further back. Without these the whole restored prefix is discarded and the
+// conversation is re-prefilled - which is exactly the state the in-memory tier avoids by copying
+// prompt.checkpoints alongside the blob. [TAG_KV_DISK_CKPT]
+void kv_write_vec(std::ofstream & f, const std::vector<uint8_t> & v) {
+    const uint64_t n = v.size();
+    f.write((const char *) &n, sizeof(n));
+    if (n) {
+        f.write((const char *) v.data(), n);
+    }
+}
+
+bool kv_read_vec(std::ifstream & f, std::vector<uint8_t> & v) {
+    uint64_t n = 0;
+    f.read((char *) &n, sizeof(n));
+    if (!f || n > (1ull << 34)) {
+        return false;
+    }
+    v.resize(n);
+    if (n) {
+        f.read((char *) v.data(), n);
+    }
+    return (bool) f;
+}
+
+uint64_t kv_write_checkpoints(const std::string & path, const std::list<common_prompt_checkpoint> & ckpts) {
+    if (ckpts.empty()) {
+        return 0;
+    }
+
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    if (!f) {
+        return 0;
+    }
+
+    const uint32_t n = (uint32_t) ckpts.size();
+    f.write((const char *) &n, sizeof(n));
+
+    for (const auto & c : ckpts) {
+        f.write((const char *) &c.n_tokens, sizeof(c.n_tokens));
+        f.write((const char *) &c.pos_min,  sizeof(c.pos_min));
+        f.write((const char *) &c.pos_max,  sizeof(c.pos_max));
+
+        kv_write_vec(f, c.data_tgt);
+        kv_write_vec(f, c.data_dft);
+        kv_write_vec(f, c.data_spec);
+    }
+
+    const uint64_t bytes = (uint64_t) f.tellp();
+    f.close();
+
+    return f.good() ? bytes : 0;
+}
+
+bool kv_read_checkpoints(const std::string & path, std::list<common_prompt_checkpoint> & out) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        return false; // no checkpoints stored, not an error
+    }
+
+    uint32_t n = 0;
+    f.read((char *) &n, sizeof(n));
+    if (!f || n > 1024) {
+        return false;
+    }
+
+    for (uint32_t i = 0; i < n; i++) {
+        common_prompt_checkpoint c;
+
+        f.read((char *) &c.n_tokens, sizeof(c.n_tokens));
+        f.read((char *) &c.pos_min,  sizeof(c.pos_min));
+        f.read((char *) &c.pos_max,  sizeof(c.pos_max));
+
+        if (!f || !kv_read_vec(f, c.data_tgt) || !kv_read_vec(f, c.data_dft) || !kv_read_vec(f, c.data_spec)) {
+            out.clear();
+            return false;
+        }
+
+        // the task that made it is long gone; -1 keeps the eviction rule in create_checkpoint honest
+        c.id_task = -1;
+
+        out.push_back(std::move(c));
+    }
+
+    return true;
+}
+
 // a failed restore must leave the slot genuinely empty in every context, otherwise the next request
 // would measure a prefix against cells that were never installed
 void kv_reset_slot(server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
@@ -286,9 +377,10 @@ void server_prompt_cache::disk_erase(const std::string & key) {
     std::error_code ec;
 
     // .idx first: an entry stops existing the moment its commit marker is gone
-    std::filesystem::remove(disk_path(key) + ".idx", ec);
-    std::filesystem::remove(disk_path(key) + ".kv",  ec);
-    std::filesystem::remove(disk_path(key) + ".dft", ec);
+    std::filesystem::remove(disk_path(key) + ".idx",  ec);
+    std::filesystem::remove(disk_path(key) + ".kv",   ec);
+    std::filesystem::remove(disk_path(key) + ".dft",  ec);
+    std::filesystem::remove(disk_path(key) + ".ckpt", ec);
 
     disk.erase(key);
 }
@@ -350,8 +442,9 @@ bool server_prompt_cache::disk_init(const std::string & dir, const std::string &
         const std::string base = (path.parent_path() / path.stem()).string();
 
         std::filesystem::remove(path, ec);
-        std::filesystem::remove(base + ".kv",  ec);
-        std::filesystem::remove(base + ".dft", ec);
+        std::filesystem::remove(base + ".kv",   ec);
+        std::filesystem::remove(base + ".dft",  ec);
+        std::filesystem::remove(base + ".ckpt", ec);
     }
 
     SRV_INF("kv cache: '%s' holds %zu conversation(s), %.3f GiB (limit %.3f GiB, ttl %lld h)\n",
@@ -469,13 +562,17 @@ bool server_prompt_cache::disk_store(const server_prompt & prompt, const std::st
         std::filesystem::rename(base + ".dft.tmp", base + ".dft", ec);
     }
 
+    // checkpoints go with the state: on an SWA model the prefix is unusable without them
+    bytes += kv_write_checkpoints(base + ".ckpt", prompt.checkpoints);
+
     const uint64_t n_packed = packed.size() / sizeof(llama_token);
 
     // the index is the commit marker, so it goes last
     if (!kv_write_idx(base + ".idx", n_packed, bytes)) {
         SRV_WRN("kv cache: cannot write index for %s\n", key.substr(0, 12).c_str());
-        std::filesystem::remove(base + ".kv",  ec);
-        std::filesystem::remove(base + ".dft", ec);
+        std::filesystem::remove(base + ".kv",   ec);
+        std::filesystem::remove(base + ".dft",  ec);
+        std::filesystem::remove(base + ".ckpt", ec);
         return false;
     }
 
@@ -559,13 +656,22 @@ bool server_prompt_cache::disk_load(server_prompt & prompt, const std::string & 
         return false;
     }
 
-    SRV_INF("kv cache: restored %s into slot %d, %zu tokens, %.3f GiB in %.1f ms\n",
-            key.substr(0, 12).c_str(), id_slot, restored.size(),
+    // The slot's own checkpoints describe the state it used to hold; replace them with the ones
+    // stored alongside this conversation. On an SWA model the restored sequence only carries the
+    // window, so without these the server discards the whole prefix and re-prefills. [TAG_KV_DISK_CKPT]
+    std::list<common_prompt_checkpoint> ckpts;
+    if (!kv_read_checkpoints(base + ".ckpt", ckpts)) {
+        ckpts.clear();
+    }
+
+    const size_t n_ckpt = ckpts.size();
+
+    SRV_INF("kv cache: restored %s into slot %d, %zu tokens, %zu checkpoint(s), %.3f GiB in %.1f ms\n",
+            key.substr(0, 12).c_str(), id_slot, restored.size(), n_ckpt,
             it->second.bytes / (1024.0*1024.0*1024.0), (ggml_time_us() - t_start) / 1000.0);
 
-    // checkpoints describe the state this slot used to hold, not the one just installed
-    prompt.checkpoints.clear();
-    prompt.tokens = std::move(restored);
+    prompt.checkpoints = std::move(ckpts);
+    prompt.tokens      = std::move(restored);
 
     it->second.t_last = kv_now();
 
