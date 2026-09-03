@@ -1,20 +1,21 @@
-// On-disk KV cache (--kv-cache-dir).
+// On-disk KV cache (--kv-cache-dir). See server-kv-disk.h for the keying scheme.
 //
-// Prefill on some machines costs minutes while the KV state of the same conversation reads back from
-// an NVMe in a couple of seconds, so it is worth spending disk to never prefill the same prefix twice.
-// Each conversation is fingerprinted with sha1(model tag + serialized prompt tokens) and its sequence
-// state written under that name; a returning conversation is restored into a free slot instead of
-// being reprocessed. Entries are evicted least-recently-used once the store exceeds --kv-cache-max.
+// Prefill on this class of machine costs minutes where the same KV state reads back from NVMe in
+// seconds, so it is worth spending disk to never prefill a conversation twice. Measured on
+// gemma-4-26B-A4B at q8_0 KV: 15.4 KiB/token, so a 22.9k-token conversation is 344 MiB that writes
+// in 45 ms and reads in 47 ms, against 18.4 s to re-prefill it.
 //
-// Three files make up one entry:
+// An entry is three files:
 //
-//   <key>.kv   target context sequence state (llama_state_seq_save_file, carries the token list)
-//   <key>.dft  draft context sequence state, only when speculative decoding is enabled
-//   <key>.idx  small index record, written last and deleted first, so it doubles as a commit marker
+//   <key>.kv   target context state (llama_state_seq_save_file, carries the token list)
+//   <key>.dft  draft context state, when speculative decoding is on
+//   <key>.idx  index record, written last and deleted first, so it is the commit marker
 //
-// The state blobs are multi-GiB, so the index keeps the tokens resident: a lookup can measure the
-// longest common prefix against every stored conversation without reading a single byte of state.
+// llama_state_seq_save_file / _load_file are the same primitives the /slots endpoints expose, but
+// nothing here goes through HTTP: they are called in-process, on the inference thread, driven by
+// the conversation key rather than by hand.
 
+#include "server-kv-disk.h"
 #include "server-task.h"
 
 #include "common.h"
@@ -22,25 +23,17 @@
 #include "server-common.h"
 
 #include <algorithm>
-#include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <string>
 #include <vector>
-
-namespace {
 
 //
 // sha1
 //
 
-struct sha1_state {
-    uint32_t h[5]  = { 0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0 };
-    uint64_t n_len = 0;
-    uint8_t  buf[64];
-    size_t   n_buf = 0;
-};
+namespace {
 
 inline uint32_t sha1_rol(uint32_t v, int b) {
     return (v << b) | (v >> (32 - b));
@@ -63,26 +56,26 @@ void sha1_compress(sha1_state & s, const uint8_t * p) {
         uint32_t f, k;
 
         if (i < 20) {
-            f = (b & c) | ((~b) & d);         k = 0x5A827999;
+            f = (b & c) | ((~b) & d);        k = 0x5A827999;
         } else if (i < 40) {
-            f = b ^ c ^ d;                    k = 0x6ED9EBA1;
+            f = b ^ c ^ d;                   k = 0x6ED9EBA1;
         } else if (i < 60) {
-            f = (b & c) | (b & d) | (c & d);  k = 0x8F1BBCDC;
+            f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC;
         } else {
-            f = b ^ c ^ d;                    k = 0xCA62C1D6;
+            f = b ^ c ^ d;                   k = 0xCA62C1D6;
         }
 
         const uint32_t t = sha1_rol(a, 5) + f + e + k + w[i];
 
-        e = d;
-        d = c;
-        c = sha1_rol(b, 30);
-        b = a;
-        a = t;
+        e = d; d = c; c = sha1_rol(b, 30); b = a; a = t;
     }
 
     s.h[0] += a; s.h[1] += b; s.h[2] += c; s.h[3] += d; s.h[4] += e;
 }
+
+const char * HEX = "0123456789abcdef";
+
+} // namespace
 
 void sha1_update(sha1_state & s, const void * data, size_t n) {
     const uint8_t * p = (const uint8_t *) data;
@@ -94,7 +87,7 @@ void sha1_update(sha1_state & s, const void * data, size_t n) {
 
         memcpy(s.buf + s.n_buf, p, take);
 
-        s.n_buf += take;
+        s.n_buf += (uint32_t) take;
         p       += take;
         n       -= take;
 
@@ -105,7 +98,7 @@ void sha1_update(sha1_state & s, const void * data, size_t n) {
     }
 }
 
-std::string sha1_hex(sha1_state & s) {
+std::string sha1_hex(sha1_state s) {
     const uint64_t n_bits = s.n_len * 8;
 
     const uint8_t pad = 0x80;
@@ -130,29 +123,114 @@ std::string sha1_hex(sha1_state & s) {
     return std::string(out, 40);
 }
 
-// the fingerprint the user asked for: the conversation, bound to the model that produced it
-std::string kv_fingerprint(const std::string & model_tag, const std::vector<char> & packed) {
-    sha1_state s;
+std::string sha1_state_to_hex(const sha1_state & s) {
+    uint8_t raw[sizeof(sha1_state)];
+    memcpy(raw, &s, sizeof(s));
 
-    sha1_update(s, model_tag.data(), model_tag.size());
+    std::string out;
+    out.reserve(sizeof(raw) * 2);
 
-    const uint8_t sep = 0;
-    sha1_update(s, &sep, 1);
+    for (size_t i = 0; i < sizeof(raw); i++) {
+        out += HEX[raw[i] >> 4];
+        out += HEX[raw[i] & 0xf];
+    }
 
-    sha1_update(s, packed.data(), packed.size());
+    return out;
+}
 
-    return sha1_hex(s);
+bool sha1_state_from_hex(const std::string & hex, sha1_state & s) {
+    if (hex.size() != sizeof(sha1_state) * 2) {
+        return false;
+    }
+
+    uint8_t raw[sizeof(sha1_state)];
+
+    for (size_t i = 0; i < sizeof(raw); i++) {
+        const char hi = hex[2*i], lo = hex[2*i + 1];
+
+        const auto nib = [](char ch) -> int {
+            if (ch >= '0' && ch <= '9') return ch - '0';
+            if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+            return -1;
+        };
+
+        const int a = nib(hi), b = nib(lo);
+        if (a < 0 || b < 0) {
+            return false;
+        }
+
+        raw[i] = (uint8_t) ((a << 4) | b);
+    }
+
+    memcpy(&s, raw, sizeof(s));
+
+    if (s.n_buf >= sizeof(s.buf)) {
+        return false;
+    }
+
+    return true;
+}
+
+void server_kv_add_message(sha1_state & s, const std::string & role, const std::string & content) {
+    sha1_update(s, role.data(), role.size());
+    sha1_update(s, "\0", 1);
+    sha1_update(s, content.data(), content.size());
+    sha1_update(s, "\x01", 1);
 }
 
 //
-// index record
+// on-disk store
 //
 
-constexpr char     KV_IDX_MAGIC[8] = { 'K','V','C','A','C','H','E','1' };
-constexpr uint32_t KV_IDX_VERSION  = 1;
+namespace {
+
+constexpr char     KV_IDX_MAGIC[8] = { 'K','V','C','A','C','H','E','2' };
+constexpr uint32_t KV_IDX_VERSION  = 2;
 
 int64_t kv_now() {
     return std::filesystem::file_time_type::clock::now().time_since_epoch().count();
+}
+
+// file_time_type ticks are implementation defined; derive the tick rate rather than assume it
+int64_t kv_ticks_per_sec() {
+    using clock = std::filesystem::file_time_type::clock;
+    return std::chrono::duration_cast<clock::duration>(std::chrono::seconds(1)).count();
+}
+
+bool kv_write_idx(const std::string & path, uint64_t n_packed, uint64_t bytes) {
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    if (!f) {
+        return false;
+    }
+
+    f.write(KV_IDX_MAGIC, sizeof(KV_IDX_MAGIC));
+    f.write((const char *) &KV_IDX_VERSION, sizeof(KV_IDX_VERSION));
+    f.write((const char *) &n_packed, sizeof(n_packed));
+    f.write((const char *) &bytes,    sizeof(bytes));
+    f.close();
+
+    return f.good();
+}
+
+bool kv_read_idx(const std::string & path, uint64_t & n_packed, uint64_t & bytes) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        return false;
+    }
+
+    char     magic[8];
+    uint32_t version = 0;
+
+    f.read(magic, sizeof(magic));
+    f.read((char *) &version,  sizeof(version));
+    f.read((char *) &n_packed, sizeof(n_packed));
+    f.read((char *) &bytes,    sizeof(bytes));
+
+    if (!f || memcmp(magic, KV_IDX_MAGIC, sizeof(magic)) != 0 || version != KV_IDX_VERSION) {
+        return false;
+    }
+
+    return n_packed <= (1ull << 32);
 }
 
 llama_tokens kv_packed_to_tokens(const std::vector<char> & packed) {
@@ -165,61 +243,8 @@ llama_tokens kv_packed_to_tokens(const std::vector<char> & packed) {
     return out;
 }
 
-bool kv_write_idx(const std::string & path, const std::vector<char> & packed, uint64_t bytes) {
-    std::ofstream f(path, std::ios::binary | std::ios::trunc);
-    if (!f) {
-        return false;
-    }
-
-    const uint64_t n_packed = packed.size();
-
-    f.write(KV_IDX_MAGIC, sizeof(KV_IDX_MAGIC));
-    f.write((const char *) &KV_IDX_VERSION, sizeof(KV_IDX_VERSION));
-    f.write((const char *) &n_packed, sizeof(n_packed));
-    f.write((const char *) &bytes,    sizeof(bytes));
-    f.write(packed.data(), packed.size());
-
-    f.close();
-
-    return f.good();
-}
-
-bool kv_read_idx(const std::string & path, std::vector<char> & packed, uint64_t & bytes) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) {
-        return false;
-    }
-
-    char     magic[8];
-    uint32_t version  = 0;
-    uint64_t n_packed = 0;
-
-    f.read(magic, sizeof(magic));
-    f.read((char *) &version,  sizeof(version));
-    f.read((char *) &n_packed, sizeof(n_packed));
-    f.read((char *) &bytes,    sizeof(bytes));
-
-    if (!f || memcmp(magic, KV_IDX_MAGIC, sizeof(magic)) != 0 || version != KV_IDX_VERSION) {
-        return false;
-    }
-
-    // a truncated index is indistinguishable from a corrupt one; both are simply dropped
-    if (n_packed > (1ull << 34) || n_packed % sizeof(llama_token) != 0) {
-        return false;
-    }
-
-    packed.resize(n_packed);
-    f.read(packed.data(), n_packed);
-
-    return f.good() || (size_t) f.gcount() == n_packed;
-}
-
-} // namespace
-
-namespace {
-
 // a failed restore must leave the slot genuinely empty in every context, otherwise the next request
-// would compute a common prefix against cells that were never installed
+// would measure a prefix against cells that were never installed
 void kv_reset_slot(server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
     llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, -1, -1);
 
@@ -232,6 +257,17 @@ void kv_reset_slot(server_prompt & prompt, llama_context * ctx_tgt, llama_contex
 
 } // namespace
 
+std::string server_prompt_cache::disk_key(const std::string & conv_key) const {
+    // bind the conversation to the weights, so two models sharing a directory cannot collide
+    sha1_state s;
+
+    sha1_update(s, model_tag.data(), model_tag.size());
+    sha1_update(s, "\0", 1);
+    sha1_update(s, conv_key.data(), conv_key.size());
+
+    return sha1_hex(s);
+}
+
 std::string server_prompt_cache::disk_path(const std::string & key) const {
     return (std::filesystem::path(dir) / key).string();
 }
@@ -239,18 +275,29 @@ std::string server_prompt_cache::disk_path(const std::string & key) const {
 size_t server_prompt_cache::disk_size() const {
     size_t res = 0;
 
-    for (const auto & e : disk) {
+    for (const auto & [_, e] : disk) {
         res += e.bytes;
     }
 
     return res;
 }
 
-bool server_prompt_cache::disk_init(const std::string & dir, const std::string & model_tag, size_t limit_size, size_t min_tokens, bool has_mtmd) {
+void server_prompt_cache::disk_erase(const std::string & key) {
+    std::error_code ec;
+
+    // .idx first: an entry stops existing the moment its commit marker is gone
+    std::filesystem::remove(disk_path(key) + ".idx", ec);
+    std::filesystem::remove(disk_path(key) + ".kv",  ec);
+    std::filesystem::remove(disk_path(key) + ".dft", ec);
+
+    disk.erase(key);
+}
+
+bool server_prompt_cache::disk_init(const std::string & dir, const std::string & model_tag, size_t limit_size, int64_t ttl_s, bool has_mtmd) {
     this->dir             = dir;
     this->model_tag       = model_tag;
     this->disk_limit_size = limit_size;
-    this->disk_min_tokens = min_tokens;
+    this->disk_ttl_s      = ttl_s;
     this->disk_has_mtmd   = has_mtmd;
 
     std::error_code ec;
@@ -262,14 +309,13 @@ bool server_prompt_cache::disk_init(const std::string & dir, const std::string &
         return false;
     }
 
-    // an entry is committed by its .idx; anything else left over is from an interrupted write
     std::vector<std::filesystem::path> orphans;
 
     for (const auto & de : std::filesystem::directory_iterator(dir, ec)) {
         const auto & path = de.path();
 
         if (path.extension() == ".tmp") {
-            orphans.push_back(path);
+            orphans.push_back(path); // an interrupted write
             continue;
         }
 
@@ -279,54 +325,38 @@ bool server_prompt_cache::disk_init(const std::string & dir, const std::string &
 
         const std::string key = path.stem().string();
 
-        std::vector<char> packed;
-        uint64_t          bytes = 0;
+        uint64_t n_packed = 0;
+        uint64_t bytes    = 0;
 
-        if (!kv_read_idx(path.string(), packed, bytes)) {
-            SRV_WRN("kv cache: dropping unreadable index %s\n", key.c_str());
-            orphans.push_back(path);
-            continue;
-        }
-
-        if (!std::filesystem::exists(disk_path(key) + ".kv", ec)) {
-            SRV_WRN("kv cache: dropping index %s with no state file\n", key.c_str());
+        if (!kv_read_idx(path.string(), n_packed, bytes) ||
+            !std::filesystem::exists(disk_path(key) + ".kv", ec)) {
+            SRV_WRN("kv cache: dropping incomplete entry %s\n", key.substr(0, 12).c_str());
             orphans.push_back(path);
             continue;
         }
 
         server_prompt_cache_disk_entry entry;
 
-        entry.key      = key;
-        entry.tokens   = server_tokens::deserialize(kv_packed_to_tokens(packed), has_mtmd);
-        entry.n_packed = packed.size() / sizeof(llama_token);
+        entry.n_packed = n_packed;
         entry.bytes    = bytes;
 
         const auto mtime = std::filesystem::last_write_time(path, ec);
-        entry.t_last = ec ? 0 : mtime.time_since_epoch().count();
+        entry.t_last = ec ? kv_now() : mtime.time_since_epoch().count();
 
-        disk.push_back(std::move(entry));
-    }
-
-    if (ec) {
-        SRV_WRN("kv cache: cannot scan directory '%s': %s\n", dir.c_str(), ec.message().c_str());
-        this->dir.clear();
-        return false;
+        disk.emplace(key, entry);
     }
 
     for (const auto & path : orphans) {
-        std::filesystem::remove(path, ec);
-
-        // .tmp files carry the full state, their siblings are removed with them
         const std::string base = (path.parent_path() / path.stem()).string();
+
+        std::filesystem::remove(path, ec);
         std::filesystem::remove(base + ".kv",  ec);
         std::filesystem::remove(base + ".dft", ec);
     }
 
-    std::sort(disk.begin(), disk.end(), [](const auto & a, const auto & b) { return a.t_last < b.t_last; });
-
-    SRV_INF("kv cache: '%s' holds %zu conversation(s), %.3f GiB (limit %.3f GiB)\n",
+    SRV_INF("kv cache: '%s' holds %zu conversation(s), %.3f GiB (limit %.3f GiB, ttl %lld h)\n",
             dir.c_str(), disk.size(), disk_size() / (1024.0*1024.0*1024.0),
-            disk_limit_size / (1024.0*1024.0*1024.0));
+            disk_limit_size / (1024.0*1024.0*1024.0), (long long) (disk_ttl_s / 3600));
 
     disk_prune();
 
@@ -334,31 +364,54 @@ bool server_prompt_cache::disk_init(const std::string & dir, const std::string &
 }
 
 void server_prompt_cache::disk_prune() {
-    if (dir.empty() || disk_limit_size == 0) {
+    if (dir.empty()) {
         return;
     }
 
-    std::error_code ec;
+    // age first: a stale conversation is dropped whether or not the store is over its limit
+    if (disk_ttl_s > 0) {
+        const int64_t cutoff = kv_now() - disk_ttl_s * kv_ticks_per_sec();
+
+        for (auto it = disk.begin(); it != disk.end();) {
+            if (it->second.t_last < cutoff) {
+                SRV_INF("kv cache: expiring %s (%.3f GiB, older than %lld h)\n",
+                        it->first.substr(0, 12).c_str(), it->second.bytes / (1024.0*1024.0*1024.0),
+                        (long long) (disk_ttl_s / 3600));
+
+                const std::string key = it->first;
+                ++it;
+                disk_erase(key);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    if (disk_limit_size == 0) {
+        return;
+    }
 
     while (!disk.empty() && disk_size() > disk_limit_size) {
-        // disk is kept ordered by t_last, so the front is the least recently used
-        auto it = std::min_element(disk.begin(), disk.end(),
-                [](const auto & a, const auto & b) { return a.t_last < b.t_last; });
+        auto lru = std::min_element(disk.begin(), disk.end(),
+                [](const auto & a, const auto & b) { return a.second.t_last < b.second.t_last; });
 
-        SRV_WRN("kv cache: evicting %s (%zu tokens, %.3f GiB), store over limit\n",
-                it->key.substr(0, 12).c_str(), it->tokens.size(), it->bytes / (1024.0*1024.0*1024.0));
+        SRV_INF("kv cache: evicting %s (%.3f GiB), store over its %.3f GiB limit\n",
+                lru->first.substr(0, 12).c_str(), lru->second.bytes / (1024.0*1024.0*1024.0),
+                disk_limit_size / (1024.0*1024.0*1024.0));
 
-        // .idx first: an entry stops existing the moment its commit marker is gone
-        std::filesystem::remove(disk_path(it->key) + ".idx", ec);
-        std::filesystem::remove(disk_path(it->key) + ".kv",  ec);
-        std::filesystem::remove(disk_path(it->key) + ".dft", ec);
-
-        disk.erase(it);
+        disk_erase(lru->first);
     }
 }
 
-bool server_prompt_cache::disk_store(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
-    if (dir.empty() || prompt.tokens.size() < disk_min_tokens) {
+bool server_prompt_cache::disk_store(const server_prompt & prompt, const std::string & conv_key, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+    if (dir.empty() || conv_key.empty() || prompt.tokens.size() < disk_min_tokens) {
+        return false;
+    }
+
+    const std::string key = disk_key(conv_key);
+
+    if (disk.count(key)) {
+        disk[key].t_last = kv_now(); // already stored, e.g. a regenerated turn
         return false;
     }
 
@@ -370,16 +423,6 @@ bool server_prompt_cache::disk_store(const server_prompt & prompt, llama_context
         return false;
     }
 
-    const std::string key = kv_fingerprint(model_tag, packed);
-
-    // already stored: this is the common case when a slot is saved twice without generating
-    for (auto & e : disk) {
-        if (e.key == key) {
-            e.t_last = kv_now();
-            return false;
-        }
-    }
-
     const std::string base = disk_path(key);
 
     std::error_code ec;
@@ -389,29 +432,29 @@ bool server_prompt_cache::disk_store(const server_prompt & prompt, llama_context
 
     // written under .tmp and renamed, so a crash can never leave a half-written state behind a
     // valid index. The token list travels inside the state file itself.
-    {
-        const size_t n = llama_state_seq_save_file(ctx_tgt, (base + ".kv.tmp").c_str(), id_slot,
-                (const llama_token *) packed.data(), packed.size() / sizeof(llama_token));
-        if (n == 0) {
-            SRV_WRN("kv cache: failed to write state for %s\n", key.substr(0, 12).c_str());
-            std::filesystem::remove(base + ".kv.tmp", ec);
-            return false;
-        }
+    const size_t n_tgt = llama_state_seq_save_file(ctx_tgt, (base + ".kv.tmp").c_str(), id_slot,
+            (const llama_token *) packed.data(), packed.size() / sizeof(llama_token));
 
-        bytes += n;
+    if (n_tgt == 0) {
+        SRV_WRN("kv cache: failed to write state for %s\n", key.substr(0, 12).c_str());
+        std::filesystem::remove(base + ".kv.tmp", ec);
+        return false;
     }
 
+    bytes += n_tgt;
+
     if (ctx_dft) {
-        const size_t n = llama_state_seq_save_file(ctx_dft, (base + ".dft.tmp").c_str(), id_slot,
+        const size_t n_dft = llama_state_seq_save_file(ctx_dft, (base + ".dft.tmp").c_str(), id_slot,
                 (const llama_token *) packed.data(), packed.size() / sizeof(llama_token));
-        if (n == 0) {
+
+        if (n_dft == 0) {
             SRV_WRN("kv cache: failed to write draft state for %s\n", key.substr(0, 12).c_str());
             std::filesystem::remove(base + ".kv.tmp",  ec);
             std::filesystem::remove(base + ".dft.tmp", ec);
             return false;
         }
 
-        bytes += n;
+        bytes += n_dft;
     }
 
     std::filesystem::rename(base + ".kv.tmp", base + ".kv", ec);
@@ -426,98 +469,53 @@ bool server_prompt_cache::disk_store(const server_prompt & prompt, llama_context
         std::filesystem::rename(base + ".dft.tmp", base + ".dft", ec);
     }
 
+    const uint64_t n_packed = packed.size() / sizeof(llama_token);
+
     // the index is the commit marker, so it goes last
-    if (!kv_write_idx(base + ".idx", packed, bytes)) {
+    if (!kv_write_idx(base + ".idx", n_packed, bytes)) {
         SRV_WRN("kv cache: cannot write index for %s\n", key.substr(0, 12).c_str());
         std::filesystem::remove(base + ".kv",  ec);
         std::filesystem::remove(base + ".dft", ec);
         return false;
     }
 
-    const double t_ms = (ggml_time_us() - t_start) / 1000.0;
-
-    // supersede earlier turns of this same conversation: any stored prompt that is a prefix of the
-    // one just written is reachable through it, so keeping it only costs disk
-    for (auto it = disk.begin(); it != disk.end();) {
-        if (it->tokens.size() < prompt.tokens.size() &&
-            it->tokens.get_common_prefix(prompt.tokens) == it->tokens.size()) {
-            SRV_TRC("kv cache: superseding %s (%zu tokens)\n", it->key.substr(0, 12).c_str(), it->tokens.size());
-
-            std::filesystem::remove(disk_path(it->key) + ".idx", ec);
-            std::filesystem::remove(disk_path(it->key) + ".kv",  ec);
-            std::filesystem::remove(disk_path(it->key) + ".dft", ec);
-
-            it = disk.erase(it);
-        } else {
-            ++it;
-        }
-    }
-
     server_prompt_cache_disk_entry entry;
 
-    entry.key      = key;
-    entry.tokens   = prompt.tokens.clone();
-    entry.n_packed = packed.size() / sizeof(llama_token);
+    entry.n_packed = n_packed;
     entry.bytes    = bytes;
     entry.t_last   = kv_now();
 
-    disk.push_back(std::move(entry));
+    disk[key] = entry;
 
     SRV_INF("kv cache: stored %s, %zu tokens, %.3f GiB in %.1f ms (%zu entries, %.3f GiB total)\n",
-            key.substr(0, 12).c_str(), prompt.tokens.size(), bytes / (1024.0*1024.0*1024.0), t_ms,
-            disk.size(), disk_size() / (1024.0*1024.0*1024.0));
+            key.substr(0, 12).c_str(), prompt.tokens.size(), bytes / (1024.0*1024.0*1024.0),
+            (ggml_time_us() - t_start) / 1000.0, disk.size(), disk_size() / (1024.0*1024.0*1024.0));
 
     disk_prune();
 
     return true;
 }
 
-bool server_prompt_cache::disk_load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
-    if (dir.empty() || tokens_new.empty()) {
+bool server_prompt_cache::disk_load(server_prompt & prompt, const std::string & conv_key, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+    if (dir.empty() || conv_key.empty()) {
         return false;
     }
 
-    const int lcp_cur = prompt.tokens.get_common_prefix(tokens_new);
+    // prune before the read, so an expired conversation is never resurrected
+    disk_prune();
 
-    // same rule as the in-memory tier: only move if it both keeps more of the stored context and
-    // covers more of the incoming prompt than what the slot already holds
-    float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_cur) / prompt.tokens.size() : -1.0f;
-    float f_sim_best  = float(lcp_cur) / tokens_new.size();
+    const std::string key = disk_key(conv_key);
 
-    auto it_best = disk.end();
-
-    for (auto it = disk.begin(); it != disk.end(); ++it) {
-        if (it->tokens.empty()) {
-            continue;
-        }
-
-        const int lcp = it->tokens.get_common_prefix(tokens_new);
-
-        const float f_keep = float(lcp) / it->tokens.size();
-        const float f_sim  = float(lcp) / tokens_new.size();
-
-        // restoring gigabytes to reuse a sliver of them is slower than prefilling the sliver
-        if (f_keep < 0.25f) {
-            continue;
-        }
-
-        if (f_keep_best < f_keep && f_sim_best < f_sim) {
-            f_keep_best = f_keep;
-            f_sim_best  = f_sim;
-
-            it_best = it;
-        }
-    }
-
-    if (it_best == disk.end()) {
+    auto it = disk.find(key);
+    if (it == disk.end()) {
         return false;
     }
 
-    const std::string base = disk_path(it_best->key);
+    const std::string base = disk_path(key);
 
     const int64_t t_start = ggml_time_us();
 
-    llama_tokens packed(std::max<size_t>(1, it_best->n_packed));
+    llama_tokens packed(std::max<uint64_t>(1, it->second.n_packed));
     size_t       n_packed = 0;
 
     // llama_state_seq_load_file clears the destination sequence before installing cells, so a
@@ -526,29 +524,21 @@ bool server_prompt_cache::disk_load(server_prompt & prompt, const server_tokens 
             packed.data(), packed.size(), &n_packed);
 
     if (n_read == 0) {
-        SRV_WRN("kv cache: failed to restore %s, dropping it\n", it_best->key.substr(0, 12).c_str());
-
-        std::error_code ec;
-        std::filesystem::remove(base + ".idx", ec);
-        std::filesystem::remove(base + ".kv",  ec);
-        std::filesystem::remove(base + ".dft", ec);
-
-        disk.erase(it_best);
-
+        SRV_WRN("kv cache: failed to restore %s, dropping it\n", key.substr(0, 12).c_str());
         kv_reset_slot(prompt, ctx_tgt, ctx_dft, id_slot);
-
+        disk_erase(key);
         return false;
     }
 
     packed.resize(n_packed);
 
     if (ctx_dft) {
-        llama_tokens packed_dft(std::max<size_t>(1, it_best->n_packed));
-        size_t       n_packed_dft = 0;
+        llama_tokens packed_dft(std::max<uint64_t>(1, it->second.n_packed));
+        size_t       n_dft = 0;
 
         if (llama_state_seq_load_file(ctx_dft, (base + ".dft").c_str(), id_slot,
-                    packed_dft.data(), packed_dft.size(), &n_packed_dft) == 0) {
-            SRV_WRN("kv cache: no draft state for %s, it will be rebuilt\n", it_best->key.substr(0, 12).c_str());
+                    packed_dft.data(), packed_dft.size(), &n_dft) == 0) {
+            SRV_WRN("kv cache: no draft state for %s, it will be rebuilt\n", key.substr(0, 12).c_str());
         }
     }
 
@@ -556,37 +546,28 @@ bool server_prompt_cache::disk_load(server_prompt & prompt, const server_tokens 
     try {
         restored = server_tokens::deserialize(packed, disk_has_mtmd);
     } catch (const std::exception & err) {
-        SRV_WRN("kv cache: cannot deserialize tokens for %s: %s\n", it_best->key.substr(0, 12).c_str(), err.what());
+        SRV_WRN("kv cache: cannot deserialize tokens for %s: %s\n", key.substr(0, 12).c_str(), err.what());
         kv_reset_slot(prompt, ctx_tgt, ctx_dft, id_slot);
+        disk_erase(key);
         return false;
     }
 
     if (!restored.validate(ctx_tgt)) {
-        SRV_WRN("kv cache: %s holds tokens this model cannot represent, dropping it\n", it_best->key.substr(0, 12).c_str());
-
-        std::error_code ec;
-        std::filesystem::remove(base + ".idx", ec);
-        std::filesystem::remove(base + ".kv",  ec);
-        std::filesystem::remove(base + ".dft", ec);
-
-        disk.erase(it_best);
-
+        SRV_WRN("kv cache: %s holds tokens this model cannot represent, dropping it\n", key.substr(0, 12).c_str());
         kv_reset_slot(prompt, ctx_tgt, ctx_dft, id_slot);
-
+        disk_erase(key);
         return false;
     }
 
-    const double t_ms = (ggml_time_us() - t_start) / 1000.0;
-
-    SRV_INF("kv cache: restored %s into slot %d, %zu tokens, %.3f GiB in %.1f ms (f_keep = %.3f, f_sim = %.3f)\n",
-            it_best->key.substr(0, 12).c_str(), id_slot, restored.size(),
-            it_best->bytes / (1024.0*1024.0*1024.0), t_ms, f_keep_best, f_sim_best);
+    SRV_INF("kv cache: restored %s into slot %d, %zu tokens, %.3f GiB in %.1f ms\n",
+            key.substr(0, 12).c_str(), id_slot, restored.size(),
+            it->second.bytes / (1024.0*1024.0*1024.0), (ggml_time_us() - t_start) / 1000.0);
 
     // checkpoints describe the state this slot used to hold, not the one just installed
     prompt.checkpoints.clear();
     prompt.tokens = std::move(restored);
 
-    it_best->t_last = kv_now();
+    it->second.t_last = kv_now();
 
     std::error_code ec;
     std::filesystem::last_write_time(base + ".idx", std::filesystem::file_time_type::clock::now(), ec);

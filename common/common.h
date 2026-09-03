@@ -662,6 +662,7 @@ struct common_params {
     std::string kv_cache_dir      = "";   // "" = disabled
     int32_t     kv_cache_max_mib  = 0;    // LRU budget on disk, 0 = no limit
     int32_t     kv_cache_min_toks = 256;  // do not persist prompts shorter than this
+    int32_t     kv_cache_ttl_s    = 259200; // drop entries older than this (3 days), 0 = never
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT

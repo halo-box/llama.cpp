@@ -1867,14 +1867,6 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         prompt = std::move(it_best->prompt);
 
         states.erase(it_best);
-
-        return true;
-    }
-
-    // nothing better in memory. The on-disk tier holds far more conversations than RAM can, and on
-    // this class of machine reading a state back beats re-prefilling it by two orders of magnitude.
-    if (disk_enabled()) {
-        disk_load(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot);
     }
 
     return true;

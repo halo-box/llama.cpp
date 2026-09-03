@@ -91,6 +91,12 @@ struct task_params {
     // per-request parameters for chat parsing
     common_chat_parser_params chat_parser_params;
 
+    // on-disk KV cache (--kv-cache-dir). kv_conv_key is the exact key of the conversation as it
+    // arrived, truncated at its last assistant message; kv_conv_base is the running sha1 over the
+    // full arriving conversation, extended with the reply to form the key this turn stores under.
+    std::string kv_conv_key;
+    std::string kv_conv_base;
+
     // message spans for checkpointing
     common_chat_msg_spans message_spans;
 
@@ -609,14 +615,11 @@ struct server_prompt_cache_state {
     }
 };
 
-// one conversation persisted under --kv-cache-dir. The tokens are kept resident so a lookup can
-// measure the longest common prefix without touching the (multi-GiB) state blob on disk.
+// one conversation persisted under --kv-cache-dir, keyed by an exact sha1 of the conversation
 struct server_prompt_cache_disk_entry {
-    std::string   key; // sha1(model tag + packed prompt tokens), also the file name
-    server_tokens tokens;
-    size_t        n_packed = 0; // length of the serialized token blob, sizes the restore buffer
-    size_t        bytes    = 0;
-    int64_t       t_last   = 0; // LRU clock, seeded from the file mtime at startup
+    uint64_t n_packed = 0; // length of the serialized token blob, sizes the restore buffer
+    uint64_t bytes    = 0;
+    int64_t  t_last   = 0; // LRU clock, seeded from the file mtime at startup
 };
 
 struct server_prompt_cache {
@@ -651,35 +654,37 @@ struct server_prompt_cache {
     //
     // on-disk tier (--kv-cache-dir)
     //
+    // Lookup is an exact key, not a prefix search: the caller hashes the conversation truncated at
+    // its last assistant message, which is byte-identical to what the previous turn stored.
+    //
 
     std::string dir;       // "" = disabled
-    std::string model_tag; // mixed into the fingerprint so two models never share an entry
+    std::string model_tag; // mixed into the file name so two models never share an entry
 
-    size_t disk_limit_size = 0; // in bytes, 0 = no limit
-    size_t disk_min_tokens = 0;
-    bool   disk_has_mtmd   = false;
+    size_t  disk_limit_size = 0; // in bytes, 0 = no limit
+    size_t  disk_min_tokens = 0;
+    int64_t disk_ttl_s      = 0; // drop entries older than this, 0 = never
+    bool    disk_has_mtmd   = false;
 
-    std::vector<server_prompt_cache_disk_entry> disk;
+    std::map<std::string, server_prompt_cache_disk_entry> disk;
 
     bool disk_enabled() const { return !dir.empty(); }
 
-    // scan dir and build the in-memory index; returns false if the directory is unusable
-    bool disk_init(const std::string & dir, const std::string & model_tag, size_t limit_size, size_t min_tokens, bool has_mtmd);
+    bool disk_init(const std::string & dir, const std::string & model_tag, size_t limit_size, int64_t ttl_s, bool has_mtmd);
 
-    // persist prompt's KV state, replacing any stored entry that is a prefix of it (an earlier turn
-    // of the same conversation). Returns true if something was written.
-    bool disk_store(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+    bool disk_store(const server_prompt & prompt, const std::string & conv_key, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
-    // restore the stored entry sharing the longest prefix with tokens_new, if it beats what the slot
-    // already holds. Mirrors the in-memory load() selection rule.
-    bool disk_load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+    bool disk_load(server_prompt & prompt, const std::string & conv_key, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
-    // evict least-recently-used entries until the store fits in disk_limit_size
+    // age first, then least-recently-used down to the size limit. Called before every read, so an
+    // expired conversation is never resurrected.
     void disk_prune();
 
+    void disk_erase(const std::string & key);
+
+    std::string disk_key (const std::string & conv_key) const;
     std::string disk_path(const std::string & key) const;
 
-    // stats, for logging
     size_t disk_size() const;
 };
 
