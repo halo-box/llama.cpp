@@ -87,6 +87,85 @@ llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
     </tr>
 <table>
 
+## Running Qwen3.8 Flash Next
+
+Qwen3.8-Flash-Next (arch `qwen4exp`) carries an n-gram hash-embedding table, `per_layer_token_embd`:
+320M rows of 90 bytes, 28.8 GB, about a third of the model's bytes. One token gathers 16 of those rows
+at unrelated hashed offsets, so the working set is only a few thousand rows per batch. Keeping the whole
+table resident spends RAM that the weights and the KV cache need more - on a unified-memory box they all
+compete for the same pool.
+
+`--ngram-on-disk` leaves the table in the GGUF file. The tensor is created but never allocated, mapped or
+loaded; each ubatch `pread`s exactly the rows it gathers and hands them over dequantized:
+
+```sh
+llama-server -m Qwen3.8-Flash-Next-IQ4_XS.gguf --ngram-on-disk
+```
+
+At load the model reports what it decided - the file and offset it will read from, the row count, row width
+and type, bytes per row and total size on disk, then the I/O mode, reader threads and row cache:
+
+```
+load_arch_tensors: PLE n-gram table stays on disk: <file> @ <offset>: <rows> rows x <ne0> <type>
+(<bytes> B/row, <size> GiB), direct I/O, 64 threads, row cache 256 MiB
+```
+
+### Tuning
+
+| Flag | Default | What it does |
+| --- | --- | --- |
+| `--ngram-on-disk` | off | keep the table on disk instead of in memory |
+| `--ngram-io-threads N` | 64 | parallel readers. Random 4 KiB reads need queue depth to saturate an NVMe: the drive these defaults came from does 62k IOPS at 16 threads, 130k at 64, and about 160k at 128+ |
+| `--ngram-cache MiB` | 256 | direct-mapped cache of raw rows, `0` disables it |
+| `--ngram-direct-io`, `--no-ngram-direct-io` | on | read with `O_DIRECT` so the rows do not land in the page cache either. Falls back to buffered reads with a warning if the `O_DIRECT` open fails |
+
+Each has an `LLAMA_ARG_*` environment equivalent (`LLAMA_ARG_NGRAM_ON_DISK` and so on).
+
+The defaults assume NVMe. On a slower device, raise `--ngram-cache` and lower `--ngram-io-threads`; if the
+table lives on a filesystem that does not support `O_DIRECT`, pass `--no-ngram-direct-io` to skip the
+failed open.
+
+### MTP speculative decoding
+
+The model ships a multi-token-prediction head, which this fork can drive as the draft model instead of a
+second full model. Point `-md` at the MTP GGUF:
+
+```sh
+llama-server -m Qwen3.8-Flash-Next-IQ4_XS.gguf --ngram-on-disk \
+             --spec-type draft-mtp -md Qwen3.8-Flash-Next-MTP-Q8_0.gguf
+```
+
+With `-hf`, `--spec-type draft-mtp` also makes the downloader pick the MTP sidecar out of the same repo,
+and the type is inferred automatically when such a sidecar is present.
+
+### Notes
+
+- `--ngram-on-disk` is a no-op on any other architecture. Only `qwen4exp` has this table.
+- The flag crashed on every model before commit `bb10d0834`. Anything older needs that fix first.
+
+## Hiding a model from GET /models
+
+Running llama-server in router mode, the INI preset file takes one extra option this fork adds: `hidden`.
+
+```ini
+; only useful as a draft model, keep it out of the picker
+[ggml-org/MY-MODEL-MTP-GGUF:Q4_K_M]
+hidden = 1
+```
+
+A model marked `hidden = 1` is left out of `GET /models` and `GET /v1/models`. It can still be loaded and used
+by requesting it by name - this only changes what appears in listings, such as the model picker in the web UI.
+
+It earns its keep on entries that are discovered rather than chosen. llama-server picks models up from the HF
+cache and from `--models-dir` on its own, so a draft or MTP GGUF lands in the picker next to the real models
+even though nobody would ever chat with it. A preset section whose name matches an existing model merges into
+that entry instead of creating a new one, so the stub above is all it takes to hide something that arrived
+from the cache.
+
+Do not set `hidden` in the `[*]` section: it applies to every preset and empties the list.
+
+The other preset-only options are documented under [Model presets](tools/server/README.md#model-presets).
+
 ## Description
 
 The main goal of `llama.cpp` is to enable LLM (and VLM) inference with minimal setup and state-of-the-art performance on
