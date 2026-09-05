@@ -1028,6 +1028,7 @@ void process_shaders() {
 
     string_to_spv("topk_argsort_f32", "topk_argsort.comp", {{"A_TYPE", "float"}});
     string_to_spv("topk_nary_search_f32", "topk_nary_search.comp", {{"A_TYPE", "float"}});
+    string_to_spv("topk_radix_select_f32", "topk_radix_select.comp", {{"A_TYPE", "float"}});
 
     string_to_spv("topk_radix_f32", "topk_radix.comp", {{"A_TYPE", "float"}});
 
