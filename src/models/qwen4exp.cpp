@@ -288,7 +288,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
         const int flags = ml.load_mtp ? 0 : TENSOR_SKIP;
 
-        const int64_t n_ff_exp   = hparams.n_ff_exp   ? hparams.n_ff_exp   : n_ff / n_expert_used;
+        const int64_t n_ff_exp   = hparams.n_ff_exp() ? hparams.n_ff_exp() : n_ff / n_expert_used;
         const int64_t n_ff_shexp = hparams.n_ff_shexp ? hparams.n_ff_shexp : n_ff;
         const int64_t idx_dim    = hparams.indexer_head_size;
 

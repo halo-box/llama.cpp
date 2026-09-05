@@ -14024,7 +14024,7 @@ static void ggml_vk_argsort(ggml_backend_vk_context * ctx, vk_context& subctx, c
 // Tournament-reduction top_k, only correct while k fits a single workgroup's
 // tournament pipeline (see ggml_vk_topk's dispatcher and the large-k path below
 // for why this can't just be given a bigger workgroup).
-static void ggml_vk_topk_small(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
+static void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
     uint32_t ncols = src0->ne[0];
     uint32_t nrows = ggml_nrows(src0);
     uint32_t k = dst->ne[0];
