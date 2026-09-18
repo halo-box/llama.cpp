@@ -327,10 +327,6 @@ extern "C" {
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
 
-        // n-gram hash-embedding table kept on disk (see ple_on_disk below)
-        int32_t ple_io_threads; // parallel pread workers
-        int32_t ple_cache_mb;   // in-memory cache of recently read rows, 0 disables
-
         // proportion of the model (layers or rows) to offload to each GPU, size: llama_max_devices()
         const float * tensor_split;
 
@@ -352,9 +348,6 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
-        bool ple_on_disk;     // keep the n-gram hash-embedding table (per_layer_token_embd) on disk: never
-                              // mapped or loaded, the rows a batch needs are read from the file (qwen4exp)
-        bool ple_direct_io;   // read those rows with O_DIRECT, bypassing the page cache
     };
 
     struct llama_sampler_seq_config {
@@ -1368,7 +1361,7 @@ extern "C" {
     LLAMA_API struct llama_sampler * llama_sampler_chain_get(      struct llama_sampler * chain, int32_t i);
 
     // the total number of samplers in the chain
-    LLAMA_API int                    llama_sampler_chain_n  (const struct llama_sampler * chain);
+    LLAMA_API int32_t                llama_sampler_chain_n  (const struct llama_sampler * chain);
 
     // after removing a sampler, the chain will no longer own it, and it will not be freed when the chain is freed
     LLAMA_API struct llama_sampler * llama_sampler_chain_remove(   struct llama_sampler * chain, int32_t i);
