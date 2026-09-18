@@ -69,6 +69,24 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
     } else {
         store_a(col, row, FLOAT_TYPEV2(0.0f));
     }
+#elif defined(DATA_A_PTQ1_0)
+    const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+
+    const uint ib  = idx / 16;
+    const uint grp = idx & 0xfu;      // which 8-element group inside the block
+    const uint e0  = grp * 8u;
+
+    const float d = float(data_a[ib].d);
+
+    const uint k_pair = row * LOAD_VEC_A / 2;
+    vec4 lo, hi;
+    ptq1_0_trits8(ib, 0u, e0, lo, hi);
+    lo *= d;
+    hi *= d;
+    store_a(col, k_pair,     FLOAT_TYPEV2(lo.xy));
+    store_a(col, k_pair + 1, FLOAT_TYPEV2(lo.zw));
+    store_a(col, k_pair + 2, FLOAT_TYPEV2(hi.xy));
+    store_a(col, k_pair + 3, FLOAT_TYPEV2(hi.zw));
 #elif defined(DATA_A_IQ1_S)
     const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
     const uint k_pair = row * LOAD_VEC_A / 2;

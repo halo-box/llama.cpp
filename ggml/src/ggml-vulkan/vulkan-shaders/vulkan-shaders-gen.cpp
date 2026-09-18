@@ -50,6 +50,7 @@ const std::vector<std::string> type_names = {
     "f32",
     "f16",
     "q1_0",
+    "ptq1_0",
     "q2_0",
     "q4_0",
     "q4_1",
@@ -597,6 +598,13 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         if (tname == "bf16") {
             continue;
         }
+        // PTQ1_0 has no coopmat2 decoder: dequant_funcs_cm2.glsl carries no PTQ1_0 entry,
+        // so emitting mul_mm_cm2 for it fails shader compilation and takes the whole
+        // Vulkan build down, not just this type. Skip it; it falls back to the scalar and
+        // coopmat1 matmul paths, which are the ones implemented and tested.
+        if (coopmat2 && tname == "ptq1_0") {
+            continue;
+        }
 
         // Float types keep per-type compilation (different accumulation loop structure)
         if (tname == "f32" || tname == "f16") {
@@ -629,8 +637,8 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         }
 #endif
 
-        if (is_lut_quant(tname)) {
-            std::string lva = lut_load_vec_a(tname);
+        if (is_lut_quant(tname) || tname == "ptq1_0") {
+            std::string lva = tname == "ptq1_0" ? "8" : lut_load_vec_a(tname);
 
             string_to_spv(shader_name + "_" + tname + "_f16" + dot2_sfx, source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", lva}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"B_TYPE_SCALAR", "float16_t"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
 
