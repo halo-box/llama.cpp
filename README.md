@@ -2,38 +2,36 @@
 
 <img src="halo-box.png" alt="Halo Box" width="260">
 
-<b>llama.cpp, close to mainline, with more</b>
+<b>Archived: development continues in <a href="https://github.com/halo-box/strix-llama.cpp">halo-box/strix-llama.cpp</a></b>
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
 [upstream llama.cpp](https://github.com/ggml-org/llama.cpp) / [ggml](https://github.com/ggml-org/ggml) / [halo-box/strix-llama.cpp](https://github.com/halo-box/strix-llama.cpp)
 
-## Halo Box
+> [!IMPORTANT]
+> **This fork is being archived.** It no longer receives upstream syncs, fixes or new features. Halo Box is
+> maintained in a single fork from now on: **[halo-box/strix-llama.cpp](https://github.com/halo-box/strix-llama.cpp)**.
 
-The goal is simple: more functionality, and the fastest llama.cpp around. And help the community with a single fast
-llama.cpp fork instead of many competing ones.
+## Where to go
 
-Halo Box keeps two forks, and which one you want depends on your hardware:
-
-| Fork | What it is |
+| You want | Use |
 | --- | --- |
-| [halo-box/llama.cpp](https://github.com/halo-box/llama.cpp) (this repo) | Stays close to mainline. Tracks upstream `master` and adds features and speedups on top, without diverging from how upstream works. |
-| [halo-box/strix-llama.cpp](https://github.com/halo-box/strix-llama.cpp) | Purely optimised for AMD Strix Halo machines (Ryzen AI Max+, RDNA 3.5 / gfx1151). Free to diverge from upstream wherever that buys speed. |
+| The fastest llama.cpp on AMD Strix Halo (Ryzen AI Max+, RDNA 3.5 / gfx1151), with everything this fork carried | [halo-box/strix-llama.cpp](https://github.com/halo-box/strix-llama.cpp) |
+| Mainline llama.cpp on any other hardware | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) |
 
-Use this repo if you want upstream behaviour plus extras. Use `strix-llama.cpp` if you run a Strix Halo box and
-want every last token/s out of it. Everything here is merged into `strix-llama.cpp` regularly, so that repo is a
-superset of this one.
+Everything in this repo was merged into `strix-llama.cpp` regularly, so that repo is a superset of this one. Open
+issues and pull requests here should be re-filed against `strix-llama.cpp`.
 
-## What this is
+## Why
 
-A community fork of [`llama.cpp`](https://github.com/ggml-org/llama.cpp) that stays close to mainline. It tracks
-upstream `master`, merges it in regularly, and adds features and speedups on top without changing how upstream
-behaves. Upstream behaviour is unchanged - this is a superset, not a rewrite.
+Halo Box kept two forks: this one, close to mainline, and `strix-llama.cpp`, optimised purely for Strix Halo. This
+fork existed to carry a few generic patches on top of upstream `master` and to stage them for `ggml-org/llama.cpp`.
+Those patches have since landed upstream or been reverted, so the reason for a separate close-to-mainline fork is
+gone. Meanwhile every upstream sync had to be done twice, once per fork, which is not worth it when everything that
+remains here is carried by `strix-llama.cpp` as well.
 
-It is also the staging fork for the pair: anything general enough for upstream is developed here, on `halo/*`
-branches, and submitted to `ggml-org/llama.cpp` from here under the upstream project's contribution and AI-usage
-rules. What stays here is either not yet ready to go up, or too niche for mainline. Work that only makes sense on
-AMD Strix Halo lives in [strix-llama.cpp](https://github.com/halo-box/strix-llama.cpp) instead.
+The repository stays available read-only, with its full history. The rest of this README describes the fork as it
+was when it was archived.
 
 ## Quick start
 
